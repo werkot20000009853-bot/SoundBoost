@@ -4,6 +4,8 @@ SoundBoost — усилитель системного звука для Windows
 
 Возможности:
   • DSP-усиление звука (WASAPI loopback -> усилитель -> устройство вывода)
+  • Режим «Приложение → динамики» (Process Loopback) — усиление на ноутбуке
+    с единственным выходом без эха
   • Ползунок усиления 100–500 %, softmax-лимитер против клиппинга
   • Управление системной громкостью и громкостью каждого приложения
   • Авто-настройка: делает свободный выход «виртуальным источником» и
@@ -16,6 +18,7 @@ SoundBoost — усилитель системного звука для Windows
 import json
 import os
 import threading
+import time
 import tkinter.messagebox as messagebox
 
 import customtkinter as ctk
@@ -23,6 +26,11 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 from pycaw.constants import ERole
 from pycaw.pycaw import AudioUtilities
+
+try:
+    import process_loopback as plb
+except Exception:  # модуль может отсутствовать в старой сборке
+    plb = None
 
 APP_TITLE = "SoundBoost — усилитель системного звука"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +45,9 @@ DEFAULT_SETTINGS = {
     "system_volume": 100.0,
     "system_mute": False,
     "original_default_id": "",
+    "mode": "device",          # device | app
+    "app_choice": "Все приложения",
+    "mute_original": True,
 }
 
 
@@ -229,6 +240,158 @@ class BoostEngine(threading.Thread):
             self.on_status("Остановлено")
 
 
+def all_audio_sessions():
+    """Все аудиосессии на всех активных устройствах вывода."""
+    try:
+        import comtypes
+        from pycaw.api.audiopolicy import IAudioSessionControl2, IAudioSessionManager2
+        from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
+        from pycaw.constants import (
+            CLSID_MMDeviceEnumerator, DEVICE_STATE, EDataFlow,
+        )
+        from pycaw.utils import AudioSession
+
+        enumerator = comtypes.CoCreateInstance(
+            CLSID_MMDeviceEnumerator, IMMDeviceEnumerator,
+            comtypes.CLSCTX_INPROC_SERVER,
+        )
+        devices = enumerator.EnumAudioEndpoints(
+            EDataFlow.eRender.value, DEVICE_STATE.ACTIVE.value
+        )
+        sessions = []
+        for i in range(devices.GetCount()):
+            device = devices.Item(i)
+            if device is None:
+                continue
+            try:
+                manager = device.Activate(
+                    IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None
+                ).QueryInterface(IAudioSessionManager2)
+                session_enum = manager.GetSessionEnumerator()
+            except Exception:
+                continue
+            for j in range(session_enum.GetCount()):
+                control = session_enum.GetSession(j)
+                if control is None:
+                    continue
+                try:
+                    control2 = control.QueryInterface(IAudioSessionControl2)
+                    if control2 is not None:
+                        sessions.append(AudioSession(control2))
+                except Exception:
+                    pass
+        if sessions:
+            return sessions
+    except Exception:
+        pass
+    return list(AudioUtilities.GetAllSessions())
+
+
+def audio_programs():
+    """Список (имя, PID) программ, у которых есть активная аудиосессия."""
+    programs = {}
+    for session in all_audio_sessions():
+        if session.Process is None:
+            continue
+        try:
+            name = session.Process.name()
+            pid = int(session.ProcessId)
+        except Exception:
+            continue
+        if pid == os.getpid():
+            continue
+        programs.setdefault(name, pid)
+    return sorted(programs.items())
+
+
+class ProcessBoostEngine(threading.Thread):
+    """Усиление без эха: захват выбранных приложений -> DSP -> динамики."""
+
+    def __init__(self, pids, sink_index, on_status, on_error):
+        super().__init__(daemon=True)
+        self.pids = list(pids)
+        self.sink_index = sink_index
+        self.on_status = on_status
+        self.on_error = on_error
+        self.gain = 1.0
+        self.limiter = True
+        self._stop_event = threading.Event()
+        self._pa = None
+        self._out = None
+        self._captures = []
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        if plb is None or not plb.is_supported():
+            self.on_error(
+                "Захват приложений требует Windows 11 или Windows 10 build 20348+. "
+                "На этой версии Windows используйте виртуальный аудиокабель."
+            )
+            return
+        try:
+            self._pa = pyaudio.PyAudio()
+            sink = self._pa.get_device_info_by_index(self.sink_index)
+            rate = 48000
+            channels = min(int(sink["maxOutputChannels"]) or 2, 2)
+            self._out = self._pa.open(
+                format=pyaudio.paFloat32,
+                channels=channels,
+                rate=rate,
+                output=True,
+                output_device_index=self.sink_index,
+                frames_per_buffer=FRAMES,
+            )
+            for pid in self.pids:
+                capture = plb.ProcessLoopbackCapture(pid, rate, 2)
+                capture.start()
+                self._captures.append(capture)
+
+            self.on_status(
+                f"Работает (приложения: {len(self._captures)}) · 48 кГц · без эха"
+            )
+            while not self._stop_event.is_set():
+                mixed = np.zeros((FRAMES, 2), dtype=np.float32)
+                alive = []
+                for capture in self._captures:
+                    try:
+                        mixed += capture.read_now(FRAMES)
+                        alive.append(capture)
+                    except Exception:
+                        capture.close()
+                self._captures = alive
+                if not alive:
+                    self.on_error("Приложение закончило воспроизведение — усиление остановлено.")
+                    return
+                mixed = remap_channels(mixed, 2, channels)
+                mixed = apply_gain(mixed, self.gain, self.limiter)
+                self._out.write(mixed.tobytes())
+
+        except Exception as exc:  # noqa: BLE001
+            if not self._stop_event.is_set():
+                self.on_error(str(exc))
+        finally:
+            for capture in self._captures:
+                try:
+                    capture.close()
+                except Exception:
+                    pass
+            self._captures = []
+            if self._out is not None:
+                try:
+                    self._out.stop_stream()
+                    self._out.close()
+                except Exception:
+                    pass
+            if self._pa is not None:
+                try:
+                    self._pa.terminate()
+                except Exception:
+                    pass
+            self.on_status("Остановлено")
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -384,34 +547,53 @@ class SoundBoostApp(ctk.CTk):
         ctk.CTkLabel(
             card, text="МАРШРУТИЗАЦИЯ ЗВУКА", font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#7dd3fc",
-        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=20, pady=(14, 6))
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(14, 6))
 
-        ctk.CTkLabel(card, text="Источник (loopback):", font=ctk.CTkFont(size=12)).grid(
-            row=1, column=0, sticky="w", padx=(20, 6), pady=6
+        self.mode_segment = ctk.CTkSegmentedButton(
+            card,
+            values=["Устройство", "Приложение (без эха)"],
+            command=self.on_mode_change,
         )
+        self.mode_segment.set(
+            "Приложение (без эха)" if self.settings["mode"] == "app" else "Устройство"
+        )
+        self.mode_segment.grid(row=0, column=2, columnspan=2, sticky="e", padx=(0, 20), pady=(12, 4))
+
+        # Источник: устройство (традиционный режим)
+        self.source_label = ctk.CTkLabel(card, text="Источник (loopback):", font=ctk.CTkFont(size=12))
         self.source_names = [d["name"] for d in loopback_devices(self.devices)]
         self.source_combo = ctk.CTkComboBox(
             card, values=self.source_names or ["— нет —"], width=260
         )
-        self.source_combo.set(self.settings["source"] or (self.source_names[0] if self.source_names else "— нет —"))
-        self.source_combo.grid(row=1, column=1, sticky="ew", padx=(0, 16), pady=6)
+        self.source_combo.set(
+            self.settings["source"] or (self.source_names[0] if self.source_names else "— нет —")
+        )
+
+        # Источник: приложение (режим без эха)
+        self.app_label = ctk.CTkLabel(card, text="Приложение:", font=ctk.CTkFont(size=12))
+        self.app_pid_map = {}
+        self.app_combo = ctk.CTkComboBox(card, values=["Все приложения"], width=260)
+        self.refresh_app_list()
 
         ctk.CTkLabel(card, text="Вывод (динамики):", font=ctk.CTkFont(size=12)).grid(
-            row=1, column=2, sticky="w", padx=(6, 6), pady=6
+            row=2, column=2, sticky="w", padx=(6, 6), pady=6
         )
         self.sink_names = [d["name"] for d in output_devices(self.devices)]
         self.sink_combo = ctk.CTkComboBox(
             card, values=self.sink_names or ["— нет —"], width=260
         )
-        self.sink_combo.set(self.settings["sink"] or (self.sink_names[0] if self.sink_names else "— нет —"))
-        self.sink_combo.grid(row=1, column=3, sticky="ew", padx=(0, 20), pady=6)
+        self.sink_combo.set(
+            self.settings["sink"] or (self.sink_names[0] if self.sink_names else "— нет —")
+        )
+        self.sink_combo.grid(row=2, column=3, sticky="ew", padx=(0, 20), pady=6)
 
         buttons = ctk.CTkFrame(card, fg_color="transparent")
-        buttons.grid(row=2, column=0, columnspan=4, sticky="ew", padx=20, pady=(8, 6))
-        ctk.CTkButton(
+        buttons.grid(row=3, column=0, columnspan=4, sticky="ew", padx=20, pady=(8, 6))
+        self.auto_button = ctk.CTkButton(
             buttons, text="Авто-настройка", width=150, height=32,
             command=self.auto_setup,
-        ).pack(side="left", padx=(0, 8))
+        )
+        self.auto_button.pack(side="left", padx=(0, 8))
         ctk.CTkButton(
             buttons, text="Обновить список", width=150, height=32,
             fg_color="gray25", hover_color="gray35", command=self.refresh_devices,
@@ -420,16 +602,21 @@ class SoundBoostApp(ctk.CTk):
             buttons, text="Восстановить вывод", width=170, height=32,
             fg_color="gray25", hover_color="gray35", command=self.restore_default_device,
         ).pack(side="left")
+        self.mute_original_switch = ctk.CTkSwitch(
+            buttons, text="Заглушить оригинал", font=ctk.CTkFont(size=11),
+            command=self.on_mute_original_change,
+        )
+        if self.settings["mute_original"]:
+            self.mute_original_switch.select()
+        self.mute_original_switch.pack(side="left", padx=(12, 0))
+        self.muted_pids = set()
 
-        ctk.CTkLabel(
-            card,
-            text="Источник — это [Loopback] неиспользуемого выхода; данные идут на реальные динамики. "
-                 "Если оборудования без перезаписи нет — установите виртуальный кабель (VB-Cable).",
-            font=ctk.CTkFont(size=11),
-            text_color="gray65",
-            wraplength=860,
-            justify="left",
-        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=20, pady=(2, 14))
+        self.hint_label = ctk.CTkLabel(
+            card, text="", font=ctk.CTkFont(size=11), text_color="gray65",
+            wraplength=860, justify="left",
+        )
+        self.hint_label.grid(row=4, column=0, columnspan=4, sticky="w", padx=20, pady=(2, 14))
+        self.apply_mode_ui()
 
     def build_system_volume(self):
         card = ctk.CTkFrame(self, corner_radius=16)
@@ -504,6 +691,71 @@ class SoundBoostApp(ctk.CTk):
             font=ctk.CTkFont(size=11), fg_color="gray25", hover_color="gray35",
             command=self.show_help,
         ).pack(side="right")
+
+    # ---------- режимы и списки ----------
+
+    def refresh_app_list(self):
+        """Обновить список программ, звук которых можно усилить."""
+        programs = audio_programs()
+        self.app_pid_map = {}
+        values = ["Все приложения"]
+        for name, pid in programs:
+            label = f"{name} (PID {pid})"
+            self.app_pid_map[label] = pid
+            values.append(label)
+        self.app_combo.configure(values=values)
+        current = self.settings.get("app_choice", "Все приложения")
+        self.app_combo.set(current if current in values else values[0])
+
+    def on_mode_change(self, value):
+        self.settings["mode"] = "app" if value.startswith("Приложение") else "device"
+        if self.engine is not None:
+            self.toggle_engine()
+        if self.settings["mode"] == "app":
+            self.refresh_app_list()
+        self.apply_mode_ui()
+
+    def apply_mode_ui(self):
+        app_mode = self.settings["mode"] == "app"
+        if app_mode:
+            self.source_label.grid_remove()
+            self.source_combo.grid_remove()
+            self.app_label.grid(row=1, column=0, sticky="w", padx=(20, 6), pady=6)
+            self.app_combo.grid(row=1, column=1, sticky="ew", padx=(0, 16), pady=6)
+            self.auto_button.pack_forget()
+            self.hint_label.configure(
+                text="Захватывается звук только выбранной программы (или всех, кроме SoundBoost). "
+                     "Усиленная копия идёт на ваши динамики — эха нет. "
+                     "Нужна Windows 11 / Windows 10 build 20348+."
+            )
+        else:
+            self.app_label.grid_remove()
+            self.app_combo.grid_remove()
+            self.source_label.grid(row=1, column=0, sticky="w", padx=(20, 6), pady=6)
+            self.source_combo.grid(row=1, column=1, sticky="ew", padx=(0, 16), pady=6)
+            self.auto_button.pack(side="left", padx=(0, 8))
+            self.hint_label.configure(
+                text="Источник — это [Loopback] неиспользуемого выхода; данные идут на реальные динамики. "
+                     "Не выбирайте один и тот же выход для захвата и вывода — будет эхо."
+            )
+
+    def on_mute_original_change(self):
+        self.settings["mute_original"] = bool(self.mute_original_switch.get())
+
+    def mute_targets(self, pids, muted):
+        """Заглушить/вернуть исходный звук усиливаемых приложений."""
+        if not self.settings["mute_original"] and muted:
+            return
+        for session in all_audio_sessions():
+            if session.ProcessId in pids and session.ProcessId != os.getpid():
+                try:
+                    session.SimpleAudioVolume.SetMute(bool(muted), None)
+                except Exception:
+                    pass
+        if muted:
+            self.muted_pids.update(pids)
+        else:
+            self.muted_pids.difference_update(pids)
 
     # ---------- обработчики ----------
 
@@ -688,11 +940,15 @@ class SoundBoostApp(ctk.CTk):
         self.toggle_button.configure(
             text="▶  ВКЛЮЧИТЬ УСИЛЕНИЕ", fg_color="#16a34a", hover_color="#15803d"
         )
+        if self.muted_pids:
+            self.mute_targets(self.muted_pids, False)
         self.engine = None
 
     def toggle_engine(self):
         if self.engine is not None:
             self.engine.stop()
+            if self.muted_pids:
+                self.mute_targets(self.muted_pids, False)
             self.engine = None
             self.toggle_button.configure(
                 text="▶  ВКЛЮЧИТЬ УСИЛЕНИЕ", fg_color="#16a34a", hover_color="#15803d"
@@ -700,25 +956,62 @@ class SoundBoostApp(ctk.CTk):
             self.engine_status("Остановлено")
             return
 
-        source = self.source_combo.get()
         sink = self.sink_combo.get()
-        if source not in self.source_by_name or sink not in self.sink_by_name:
-            messagebox.showwarning(
-                "SoundBoost", "Выберите корректные устройства источника и вывода."
-            )
+        if sink not in self.sink_by_name and self.sink_names:
+            sink = self.sink_names[0]
+            self.sink_combo.set(sink)
+        sink_index = self.sink_by_name.get(sink)
+        if sink_index is None:
+            messagebox.showwarning("SoundBoost", "Выберите корректное устройство вывода.")
             return
-        if source.replace(" [Loopback]", "").lower() == sink.lower():
-            if not messagebox.askyesno(
-                "Возможна обратная связь",
-                "Источник и вывод относятся к одному устройству — появится эхо/гул.\n"
-                "Продолжить всё равно?",
-            ):
-                return
 
-        engine = BoostEngine(
-            self.source_by_name[source], self.sink_by_name[sink],
-            self.engine_status, self.engine_error,
-        )
+        if self.settings["mode"] == "app":
+            if plb is None or not plb.is_supported():
+                messagebox.showerror(
+                    "SoundBoost",
+                    "Режим «Приложение» работает только на Windows 11 / Windows 10 build 20348+.\n"
+                    "На этой версии Windows используйте виртуальный аудиокабель (VB-Cable).",
+                )
+                return
+            self.refresh_app_list()
+            choice = self.app_combo.get()
+            if choice == "Все приложения":
+                pids = [pid for _name, pid in audio_programs()]
+            else:
+                pid = self.app_pid_map.get(choice)
+                pids = [pid] if pid else []
+            if not pids:
+                messagebox.showwarning(
+                    "SoundBoost",
+                    "Нет приложений с активным звуком. Запустите музыку/видео и нажмите «Обновить список».",
+                )
+                return
+            engine = ProcessBoostEngine(
+                pids, sink_index, self.engine_status, self.engine_error
+            )
+            self.mute_targets(pids, True)
+            self.settings["app_choice"] = choice
+        else:
+            source = self.source_combo.get()
+            if source not in self.source_by_name:
+                messagebox.showwarning(
+                    "SoundBoost", "Выберите корректный источник захвата или переключитесь в режим «Приложение»."
+                )
+                return
+            if source.replace(" [Loopback]", "").lower() == sink.lower():
+                messagebox.showerror(
+                    "Эхо — запуск заблокирован",
+                    "Источник и вывод — одно и то же устройство, звук пойдёт по кругу.\n\n"
+                    "На ноутбуке с одним выходом переключитесь в режим "
+                    "«Приложение (без эха)» — он усиливает звук программы без петли.",
+                )
+                return
+            engine = BoostEngine(
+                self.source_by_name[source], sink_index,
+                self.engine_status, self.engine_error,
+            )
+            self.settings["source"] = source
+
         engine.gain = float(self.settings["gain"]) / 100.0
         engine.limiter = bool(self.settings["limiter"])
         self.engine = engine
@@ -727,7 +1020,6 @@ class SoundBoostApp(ctk.CTk):
         self.toggle_button.configure(
             text="■  ОСТАНОВИТЬ УСИЛЕНИЕ", fg_color="#b91c1c", hover_color="#991b1b"
         )
-        self.settings["source"] = source
         self.settings["sink"] = sink
 
     def refresh_devices(self):
@@ -738,7 +1030,8 @@ class SoundBoostApp(ctk.CTk):
         self.sink_names = [d["name"] for d in output_devices(self.devices)]
         self.source_combo.configure(values=self.source_names or ["— нет —"])
         self.sink_combo.configure(values=self.sink_names or ["— нет —"])
-        messagebox.showinfo("SoundBoost", "Список устройств обновлён.")
+        self.refresh_app_list()
+        messagebox.showinfo("SoundBoost", "Список устройств и приложений обновлён.")
 
     def auto_setup(self):
         """Настроить «виртуальный источник» из второго физического выхода."""
@@ -830,21 +1123,31 @@ class SoundBoostApp(ctk.CTk):
         text.pack(fill="both", expand=True, padx=16, pady=16)
         text.insert("1.0", (
             "КАК РАБОТАЕТ\n\n"
-            "Windows ограничивает громкость 100 %. SoundBoost перехватывает поток\n"
-            "с выхода (WASAPI Loopback), умножает его на выбранный коэффициент\n"
-            "и выводит на другие динамики. Это даёт настоящее усиление до 500 %.\n\n"
-            "БЫСТРЫЙ СТАРТ\n\n"
-            "1. Нажмите «Авто-настройка» — приложение само выберет свободный\n"
-            "   выход как источник и вернёт усиленный звук на ваши динамики.\n"
-            "2. Нажмите «ВКЛЮЧИТЬ УСИЛЕНИЕ» и запустите музыку/видео.\n"
-            "3. Ползунком «Усиление» подберите комфортный уровень (обычно 150–250 %).\n\n"
+            "Windows ограничивает громкость 100 %. SoundBoost умножает звуковой\n"
+            "поток на выбранный коэффициент и выводит усиленную копию на динамики.\n"
+            "Есть два режима:\n"
+            "  • «Устройство» — захват WASAPI Loopback с другого выхода;\n"
+            "  • «Приложение (без эха)» — захват только выбранной программы через\n"
+            "    Windows Process Loopback. Идеально для ноутбука с одним динамиком.\n\n"
+            "БЫСТРЫЙ СТАРТ НА НОУТБУКЕ (ОДИН ВЫХОД)\n\n"
+            "1. Выберите режим «Приложение (без эха)».\n"
+            "2. Запустите музыку/видео и нажмите «Обновить список».\n"
+            "3. Выберите программу (или «Все приложения») и выход — ваши динамики.\n"
+            "4. Нажмите «ВКЛЮЧИТЬ УСИЛЕНИЕ» и подберите процент (обычно 150–250 %).\n\n"
+            "ЕСЛИ БОЛЬШОЙ ВЫХОД / РЕЖИМ УСТРОЙСТВА\n\n"
+            "Нажмите «Авто-настройка» — приложение само выберет свободный выход\n"
+            "как источник и вернёт усиленный звук на ваши динамики.\n\n"
             "ВАРИАНТ С ВИРТУАЛЬНЫМ КАБЕЛЕМ\n\n"
-            "Если второй физический выход недоступен, установите VB-Cable:\n"
+            "Если режим приложения недоступен (нужна Windows 11 / Win10 20348+),\n"
+            "установите VB-Cable:\n"
             "  • в Windows поставьте «Cable Input» устройством вывода по умолчанию;\n"
-            "  • в SoundBoost выберите источник «Cable Output [Loopback]»;\n"
+            "  • в SoundBoost (режим «Устройство») выберите «Cable Output [Loopback]»;\n"
             "  • в качестве вывода — ваши реальные динамики или наушники.\n\n"
             "ВАЖНО\n\n"
-            "• Не выбирайте одно и то же устройство для захвата и вывода — будет эхо.\n"
+            "• В режиме «Устройство» нельзя захватывать и выводить на одно устройство —\n"
+            "  будет эхо; запуск заблокирован. Используйте режим «Приложение».\n"
+            "• В режиме «Приложение» исходный звук программ заглушается, чтобы не было\n"
+            "  удвоения. Если звук исчез — отключите «Заглушить оригинал».\n"
             "• Лимитер включён по умолчанию и защищает от клиппинга/искажений.\n"
             "• Обработка добавляет задержку ~20–40 мс: для игр и звонков\n"
             "  лучше использовать системную громкость без DSP.\n"
@@ -862,6 +1165,8 @@ class SoundBoostApp(ctk.CTk):
                 pass
         if self.engine is not None:
             self.engine.stop()
+        if self.muted_pids:
+            self.mute_targets(self.muted_pids, False)
         try:
             current = get_system_volume(self.volume_device_name())
             self.settings["system_volume"] = current * 100
