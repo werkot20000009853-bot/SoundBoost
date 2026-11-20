@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+dist/
+build/
+_repo/
+*.spec
+soundboost_settings.json
+selftest.ok
