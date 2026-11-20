@@ -6,3 +6,4 @@ _repo/
 *.spec
 soundboost_settings.json
 selftest.ok
+*.lnk
