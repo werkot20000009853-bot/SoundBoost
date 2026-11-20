@@ -15,6 +15,7 @@ SoundBoost — усилитель системного звука для Windows
 Зависимости: customtkinter, pycaw, pyaudiowpatch, numpy
 """
 
+import ctypes
 import json
 import os
 import threading
@@ -35,7 +36,18 @@ except Exception:  # модуль может отсутствовать в ст�
 APP_TITLE = "SoundBoost — усилитель системного звука"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(BASE_DIR, "soundboost_settings.json")
-FRAMES = 512
+FRAMES = 512          # оставлен для совместимости
+BUFFER_CHOICES = (10, 20, 40)   # мс; 20 мс по умолчанию — без треска
+
+
+def boost_thread_priority():
+    """Немного поднять приоритет потока DSP, чтобы не было подрывов буфера."""
+    try:
+        kernel = ctypes.windll.kernel32
+        kernel.SetThreadPriority(kernel.GetCurrentThread(), 2)  # THREAD_PRIORITY_HIGHEST
+    except Exception:
+        pass
+
 
 DEFAULT_SETTINGS = {
     "gain": 150.0,
@@ -48,6 +60,8 @@ DEFAULT_SETTINGS = {
     "mode": "device",          # device | app
     "app_choice": "Все приложения",
     "mute_original": True,
+    "buffer_ms": 20,
+    "high_priority": True,
 }
 
 
@@ -141,8 +155,12 @@ def remap_channels(data, in_ch, out_ch):
     return np.concatenate([stereo, np.repeat(stereo[:, -1:], out_ch - 2, axis=1)], axis=1)
 
 
-def apply_gain(data, gain, limiter):
-    out = data * gain
+def apply_gain(data, gain, limiter, out=None):
+    """Усиление с софт-лимитером. При out=None создаёт новый массив."""
+    if out is None:
+        out = (data * gain).astype(np.float32, copy=False)
+    else:
+        np.multiply(data, gain, out=out)
     if limiter:
         threshold = 0.92
         magnitude = np.abs(out)
@@ -154,32 +172,39 @@ def apply_gain(data, gain, limiter):
             )
             out[over] = sign * compressed
         np.clip(out, -1.0, 1.0, out=out)
-    return out.astype(np.float32)
+    return out
 
 
 class BoostEngine(threading.Thread):
     """Поток захвата системного звука, усиления и вывода."""
 
-    def __init__(self, source_index, sink_index, on_status, on_error):
+    def __init__(self, source_index, sink_index, on_status, on_error,
+                 buffer_ms=20, high_priority=True):
         super().__init__(daemon=True)
         self.source_index = source_index
         self.sink_index = sink_index
         self.on_status = on_status
         self.on_error = on_error
+        self.buffer_ms = int(buffer_ms)
+        self.high_priority = bool(high_priority)
         self.gain = 1.0
         self.limiter = True
         self._stop_event = threading.Event()
         self._pa = None
         self._stream_in = None
         self._stream_out = None
+        self._work = None
         self.rate = 48000
         self.in_channels = 2
         self.out_channels = 2
+        self.frames = 960
 
     def stop(self):
         self._stop_event.set()
 
     def run(self):
+        if self.high_priority:
+            boost_thread_priority()
         try:
             self._pa = pyaudio.PyAudio()
             src = self._pa.get_device_info_by_index(self.source_index)
@@ -187,6 +212,10 @@ class BoostEngine(threading.Thread):
             self.rate = int(src["defaultSampleRate"]) or 48000
             self.in_channels = int(src["maxInputChannels"]) or 2
             self.out_channels = int(sink["maxOutputChannels"]) or 2
+            # Кратное периоду устройства (480/960/1920 при 48 кГц),
+            # иначе WASAPI периодически «спотыкается» и слышны щелчки.
+            self.frames = max(64, int(round(self.rate * self.buffer_ms / 1000.0)))
+            self._work = np.empty((self.frames, self.out_channels), dtype=np.float32)
 
             self._stream_in = self._pa.open(
                 format=pyaudio.paFloat32,
@@ -194,7 +223,7 @@ class BoostEngine(threading.Thread):
                 rate=self.rate,
                 input=True,
                 input_device_index=self.source_index,
-                frames_per_buffer=FRAMES,
+                frames_per_buffer=self.frames,
             )
             self._stream_out = self._pa.open(
                 format=pyaudio.paFloat32,
@@ -202,24 +231,26 @@ class BoostEngine(threading.Thread):
                 rate=self.rate,
                 output=True,
                 output_device_index=self.sink_index,
-                frames_per_buffer=FRAMES,
+                frames_per_buffer=self.frames,
             )
 
             self.on_status(
-                f"Работает · {self.rate // 1000} кГц · "
-                f"{self.in_channels} → {self.out_channels} кан."
+                f"Работает · {self.rate // 1000} кГц · буфер {self.buffer_ms} мс"
             )
 
             while not self._stop_event.is_set():
-                raw = self._stream_in.read(FRAMES, exception_on_overflow=False)
+                raw = self._stream_in.read(self.frames, exception_on_overflow=False)
                 samples = np.frombuffer(raw, dtype=np.float32)
                 usable = samples.size - samples.size % self.in_channels
                 if usable <= 0:
                     continue
-                frame = samples[:usable].reshape(-1, self.in_channels).copy()
+                frame = samples[:usable].reshape(-1, self.in_channels)
                 frame = remap_channels(frame, self.in_channels, self.out_channels)
-                frame = apply_gain(frame, self.gain, self.limiter)
-                self._stream_out.write(frame.tobytes())
+                count = min(frame.shape[0], self.frames)
+                block = self._work[:count]
+                np.copyto(block, frame[:count])
+                apply_gain(block, self.gain, self.limiter, out=block)
+                self._stream_out.write(block.tobytes())
 
         except Exception as exc:  # noqa: BLE001 — показываем ошибку пользователю
             if not self._stop_event.is_set():
@@ -307,18 +338,23 @@ def audio_programs():
 class ProcessBoostEngine(threading.Thread):
     """Усиление без эха: захват выбранных приложений -> DSP -> динамики."""
 
-    def __init__(self, pids, sink_index, on_status, on_error):
+    def __init__(self, pids, sink_index, on_status, on_error,
+                 buffer_ms=20, high_priority=True):
         super().__init__(daemon=True)
         self.pids = list(pids)
         self.sink_index = sink_index
         self.on_status = on_status
         self.on_error = on_error
+        self.buffer_ms = int(buffer_ms)
+        self.high_priority = bool(high_priority)
         self.gain = 1.0
         self.limiter = True
         self._stop_event = threading.Event()
         self._pa = None
         self._out = None
         self._captures = []
+        self._work = None
+        self.frames = 960
 
     def stop(self):
         self._stop_event.set()
@@ -330,18 +366,22 @@ class ProcessBoostEngine(threading.Thread):
                 "На этой версии Windows используйте виртуальный аудиокабель."
             )
             return
+        if self.high_priority:
+            boost_thread_priority()
         try:
             self._pa = pyaudio.PyAudio()
             sink = self._pa.get_device_info_by_index(self.sink_index)
             rate = 48000
+            self.frames = max(64, int(round(rate * self.buffer_ms / 1000.0)))
             channels = min(int(sink["maxOutputChannels"]) or 2, 2)
+            self._work = np.empty((self.frames, channels), dtype=np.float32)
             self._out = self._pa.open(
                 format=pyaudio.paFloat32,
                 channels=channels,
                 rate=rate,
                 output=True,
                 output_device_index=self.sink_index,
-                frames_per_buffer=FRAMES,
+                frames_per_buffer=self.frames,
             )
             for pid in self.pids:
                 capture = plb.ProcessLoopbackCapture(pid, rate, 2)
@@ -349,14 +389,16 @@ class ProcessBoostEngine(threading.Thread):
                 self._captures.append(capture)
 
             self.on_status(
-                f"Работает (приложения: {len(self._captures)}) · 48 кГц · без эха"
+                f"Работает (приложения: {len(self._captures)}) · "
+                f"буфер {self.buffer_ms} мс · без эха"
             )
             while not self._stop_event.is_set():
-                mixed = np.zeros((FRAMES, 2), dtype=np.float32)
+                mixed = self._work
+                mixed.fill(0)
                 alive = []
                 for capture in self._captures:
                     try:
-                        mixed += capture.read_now(FRAMES)
+                        mixed += capture.read_now(self.frames)
                         alive.append(capture)
                     except Exception:
                         capture.close()
@@ -364,8 +406,10 @@ class ProcessBoostEngine(threading.Thread):
                 if not alive:
                     self.on_error("Приложение закончило воспроизведение — усиление остановлено.")
                     return
-                mixed = remap_channels(mixed, 2, channels)
-                mixed = apply_gain(mixed, self.gain, self.limiter)
+                remapped = remap_channels(mixed, 2, channels)
+                if remapped is not mixed:
+                    np.copyto(mixed, remapped)
+                apply_gain(mixed, self.gain, self.limiter, out=mixed)
                 self._out.write(mixed.tobytes())
 
         except Exception as exc:  # noqa: BLE001
@@ -535,8 +579,32 @@ class SoundBoostApp(ctk.CTk):
             command=self.toggle_engine,
         )
         self.toggle_button.grid(
-            row=4, column=0, columnspan=3, sticky="ew", padx=20, pady=(12, 18)
+            row=4, column=0, columnspan=3, sticky="ew", padx=20, pady=(12, 8)
         )
+
+        quality = ctk.CTkFrame(card, fg_color="transparent")
+        quality.grid(row=5, column=0, columnspan=3, sticky="ew", padx=20, pady=(0, 14))
+        ctk.CTkLabel(quality, text="Буфер:", font=ctk.CTkFont(size=11)).pack(side="left")
+        self.buffer_combo = ctk.CTkComboBox(
+            quality,
+            values=[f"{ms} мс" for ms in BUFFER_CHOICES],
+            width=90,
+            command=self.on_buffer_change,
+        )
+        self.buffer_combo.set(f"{int(self.settings['buffer_ms'])} мс")
+        self.buffer_combo.pack(side="left", padx=(6, 14))
+        self.priority_switch = ctk.CTkSwitch(
+            quality, text="Высокий приоритет DSP", font=ctk.CTkFont(size=11),
+            command=self.on_priority_change,
+        )
+        if self.settings["high_priority"]:
+            self.priority_switch.select()
+        self.priority_switch.pack(side="left")
+        ctk.CTkLabel(
+            quality,
+            text="(если трещит — поставьте 40 мс)",
+            font=ctk.CTkFont(size=10), text_color="gray65",
+        ).pack(side="left", padx=(12, 0))
 
     def build_devices(self):
         card = ctk.CTkFrame(self, corner_radius=16)
@@ -781,6 +849,13 @@ class SoundBoostApp(ctk.CTk):
         if self.engine is not None:
             self.engine.limiter = self.settings["limiter"]
 
+    def on_buffer_change(self, value):
+        """Буфер влияет только на запуск — для применения перезапустите усиление."""
+        self.settings["buffer_ms"] = int(value.split()[0])
+
+    def on_priority_change(self):
+        self.settings["high_priority"] = bool(self.priority_switch.get())
+
     def update_volume_label(self, value):
         self.vol_value.configure(text=f"{int(value)}%")
 
@@ -925,7 +1000,7 @@ class SoundBoostApp(ctk.CTk):
             row["frame"].grid(row=index, column=0, sticky="ew", pady=2)
 
         self.mixer_count.configure(text=f"{len(current)} прил.")
-        self._mixer_job = self.after(2500, self.refresh_mixer)
+        self._mixer_job = self.after(4000, self.refresh_mixer)
 
     # ---------- движок ----------
 
@@ -987,7 +1062,8 @@ class SoundBoostApp(ctk.CTk):
                 )
                 return
             engine = ProcessBoostEngine(
-                pids, sink_index, self.engine_status, self.engine_error
+                pids, sink_index, self.engine_status, self.engine_error,
+                self.settings["buffer_ms"], self.settings["high_priority"],
             )
             self.mute_targets(pids, True)
             self.settings["app_choice"] = choice
@@ -1009,6 +1085,7 @@ class SoundBoostApp(ctk.CTk):
             engine = BoostEngine(
                 self.source_by_name[source], sink_index,
                 self.engine_status, self.engine_error,
+                self.settings["buffer_ms"], self.settings["high_priority"],
             )
             self.settings["source"] = source
 
@@ -1149,6 +1226,8 @@ class SoundBoostApp(ctk.CTk):
             "• В режиме «Приложение» исходный звук программ заглушается, чтобы не было\n"
             "  удвоения. Если звук исчез — отключите «Заглушить оригинал».\n"
             "• Лимитер включён по умолчанию и защищает от клиппинга/искажений.\n"
+            "• При треске/щелчках увеличьте «Буфер» до 40 мс и перезапустите\n"
+            "  усиление. Это добавит задержку, но уберёт подрывы звука.\n"
             "• Обработка добавляет задержку ~20–40 мс: для игр и звонков\n"
             "  лучше использовать системную громкость без DSP.\n"
             "• Кнопка «Восстановить вывод» возвращает прежнее устройство по умолчанию.\n"
